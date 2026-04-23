@@ -10,7 +10,7 @@ models/
 .vscode/
 outputs/
 VOC2007/
-
+VOCdevkit/
 # Distribution / packaging
 .Python
 build/
