@@ -18,27 +18,47 @@ import archs
 import losses
 from dataset import Dataset, VOCDataset
 from metrics import binary_confusion_counts, binary_segmentation_metrics, iou_score
+from multispectral_config import (
+    band_mode,
+    dataset_name,
+    image_ext,
+    ignore_zero_pixels,
+    input_channels,
+    mask_ext,
+    nodata_value,
+    normalization_config,
+    selected_band_names,
+    selected_bands,
+    vis_bands,
+)
 from utils import AverageMeter, str2bool
 
 ARCH_NAMES = archs.__all__
 LOSS_NAMES = losses.__all__
 LOSS_NAMES.append('BCEWithLogitsLoss')
 
+#先在multispectral_config.py中选择配置的波段信息，然后在下面配置参数即可
+
 TRAIN_DEFAULTS = {
     #'name': None,默认模型名字，如果不传命令行参数，默认是arch+timestamp
-    'name': 'voc_run2',
-    'epochs': 100,
+    'name': 'voc_run3',
+    'epochs': 20,
     'batch_size': 2,
     'arch': 'NestedUNet',
     'deep_supervision': False,
-    'input_channels': 3,
+    # 第三步修改：训练入口接入统一多光谱配置。
+    # 原来这里写死 input_channels=3，只适合普通 RGB。
+    # 现在从 multispectral_config.py 读取，band_mode="6band" 时自动变成 6。
+    'input_channels': input_channels,
     'num_classes': 1,
-    'input_w': 512,
-    'input_h': 512,
+    'input_w': 256,
+    'input_h': 256,
     'loss': 'BCEDiceLoss',
-    'dataset': 'VOCdevkit/VOC2007',
-    'img_ext': '.jpg',
-    'mask_ext': '.png',
+    # 第三步修改：数据集路径和影像后缀也统一从配置文件读取。
+    # 这样切换 rgb / 4band / 6band 时，训练入口不用反复手改。
+    'dataset': dataset_name,
+    'img_ext': image_ext,
+    'mask_ext': mask_ext,
     'optimizer': 'SGD',
     'lr': 1e-3,
     'momentum': 0.9,
@@ -53,6 +73,63 @@ TRAIN_DEFAULTS = {
     'early_stopping': -1,
     'num_workers': 0,
 }
+
+
+def attach_multispectral_config(config):
+    # 第三步补充：把论文实验需要复现的多光谱信息写进 config。
+    # 后面 config 会保存到 models/<name>/config.yml，
+    # 这样每次实验使用了哪些波段、哪些标准化参数都能追溯。
+    config['band_mode'] = band_mode
+    config['selected_bands'] = list(selected_bands)
+    config['selected_band_names'] = list(selected_band_names)
+    config['vis_bands'] = list(vis_bands)
+    config['nodata_value'] = nodata_value
+    config['ignore_zero_pixels'] = ignore_zero_pixels
+    config['normalization_config'] = normalization_config
+    # 第五步修改：让模型输入通道数始终等于当前选择的波段数。
+    # 即使命令行误传了 --input_channels，也以 multispectral_config.py 为准，
+    # 避免模型第一层通道数和 dataset.py 实际输出通道数不一致。
+    config['input_channels'] = len(config['selected_bands'])
+    return config
+
+
+def build_transforms(config):
+    # 第三步补充：区分 RGB 增强和多光谱增强。
+    # HueSaturationValue 是 RGB/HSV 颜色空间增强，不适合 4/6 波段遥感反射率。
+    # 多光谱模式下只保留几何增强，避免破坏各波段的物理含义。
+    train_transforms = [
+        A.RandomRotate90(),
+        A.OneOf([
+            A.HorizontalFlip(p=1),
+            A.VerticalFlip(p=1),
+        ], p=0.5),
+    ]
+
+    # 只有普通 jpg/png 的 RGB 图像才保留颜色增强。
+    # 如果 band_mode="rgb" 但 img_ext=".tif"，它仍然是 Sentinel-2 反射率数据，
+    # 不适合使用 HSV 这类面向自然图像的颜色扰动。
+    if config['band_mode'] == 'rgb' and config['img_ext'].lower() not in ['.tif', '.tiff']:
+        train_transforms.append(
+            A.OneOf([
+                A.HueSaturationValue(),
+                A.RandomBrightnessContrast(),
+            ], p=1)
+        )
+
+    train_transforms.append(A.Resize(config['input_h'], config['input_w']))
+
+    # 第三步补充：去掉 A.Normalize()。
+    # 原因是 dataset.py 已经统一完成：
+    # - RGB: /255
+    # - tif: /10000 -> clip -> mean/std
+    # 如果这里再调用 Albumentations 默认 Normalize，会把输入重复标准化，
+    # 且默认 ImageNet RGB 参数不适合多光谱。
+    train_transform = A.Compose(train_transforms)
+    val_transform = A.Compose([
+        A.Resize(config['input_h'], config['input_w']),
+    ])
+
+    return train_transform, val_transform
 
 """
 直接在上面的 TRAIN_DEFAULTS 里改训练参数。
@@ -260,6 +337,10 @@ def get_dataset_info(config):
                 'img_ext': config['img_ext'],
                 'mask_ext': config['mask_ext'],
                 'num_classes': config['num_classes'],
+                # 第三步补充：把波段选择和标准化配置传给 dataset.py。
+                # 真正读取哪些 tif 波段，是在数据集对象里执行的。
+                'selected_bands': config['selected_bands'],
+                'normalization_config': config['normalization_config'],
             },
         }
 
@@ -276,7 +357,9 @@ def get_dataset_info(config):
             with open(val_split, 'r') as f:
                 val_img_ids = [line.strip() for line in f if line.strip()]
         else:
-            img_ids = glob(os.path.join(voc_img_dir, '*.jpg'))
+            # 第三步修改：VOC fallback 不再写死查找 *.jpg。
+            # 多光谱数据通常仍放在 JPEGImages 目录下，但后缀是 .tif。
+            img_ids = glob(os.path.join(voc_img_dir, '*' + config['img_ext']))
             img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
             train_img_ids, val_img_ids = train_test_split(img_ids, test_size=0.2, random_state=41)
 
@@ -287,8 +370,12 @@ def get_dataset_info(config):
             'kwargs': {
                 'img_dir': voc_img_dir,
                 'mask_dir': voc_mask_dir,
-                'img_ext': '.jpg',
-                'mask_ext': '.png',
+                # 第三步修改：VOC 数据集也使用统一配置里的后缀。
+                # 原来这里固定 .jpg/.png，会导致 tif 训练时找不到影像。
+                'img_ext': config['img_ext'],
+                'mask_ext': config['mask_ext'],
+                'selected_bands': config['selected_bands'],
+                'normalization_config': config['normalization_config'],
             },
         }
 
@@ -299,7 +386,7 @@ def get_dataset_info(config):
 
 
 def main():
-    config = vars(parse_args())
+    config = attach_multispectral_config(vars(parse_args()))
 
     if config['name'] is None:
         if config['deep_supervision']:
@@ -357,25 +444,7 @@ def main():
 
     # Data loading code
     dataset_info = get_dataset_info(config)
-    #数据增强：
-    train_transform = A.Compose([
-        A.RandomRotate90(),
-        A.OneOf([
-            A.HorizontalFlip(p=1),
-            A.VerticalFlip(p=1),
-        ], p=0.5),
-        A.OneOf([
-            A.HueSaturationValue(),
-            A.RandomBrightnessContrast(),
-        ], p=1),#按照归一化的概率选择执行哪一个
-        A.Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
-    ])
-
-    val_transform = A.Compose([
-        A.Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
-    ])
+    train_transform, val_transform = build_transforms(config)
 
     train_dataset = dataset_info['dataset_class'](
         img_ids=dataset_info['train_img_ids'],
