@@ -29,6 +29,7 @@ from multispectral_config import (
     normalization_config,
     selected_band_names,
     selected_bands,
+    train_augmentation_config,
     vis_bands,
 )
 from utils import AverageMeter, str2bool
@@ -41,7 +42,7 @@ LOSS_NAMES.append('BCEWithLogitsLoss')
 
 TRAIN_DEFAULTS = {
     #'name': None,默认模型名字，如果不传命令行参数，默认是arch+timestamp
-    'name': 'voc_run3',
+    'name': 'voc_run5',
     'epochs': 20,
     'batch_size': 2,
     'arch': 'NestedUNet',
@@ -86,6 +87,7 @@ def attach_multispectral_config(config):
     config['nodata_value'] = nodata_value
     config['ignore_zero_pixels'] = ignore_zero_pixels
     config['normalization_config'] = normalization_config
+    config['train_augmentation_config'] = train_augmentation_config
     # 第五步修改：让模型输入通道数始终等于当前选择的波段数。
     # 即使命令行误传了 --input_channels，也以 multispectral_config.py 为准，
     # 避免模型第一层通道数和 dataset.py 实际输出通道数不一致。
@@ -97,27 +99,15 @@ def build_transforms(config):
     # 第三步补充：区分 RGB 增强和多光谱增强。
     # HueSaturationValue 是 RGB/HSV 颜色空间增强，不适合 4/6 波段遥感反射率。
     # 多光谱模式下只保留几何增强，避免破坏各波段的物理含义。
+    # Random training augmentation is handled in dataset.py through
+    # train_augmentation_config so it stays aligned with the u2net branch.
     train_transforms = [
-        A.RandomRotate90(),
-        A.OneOf([
-            A.HorizontalFlip(p=1),
-            A.VerticalFlip(p=1),
-        ], p=0.5),
+        A.Resize(config['input_h'], config['input_w']),
     ]
 
     # 只有普通 jpg/png 的 RGB 图像才保留颜色增强。
     # 如果 band_mode="rgb" 但 img_ext=".tif"，它仍然是 Sentinel-2 反射率数据，
     # 不适合使用 HSV 这类面向自然图像的颜色扰动。
-    if config['band_mode'] == 'rgb' and config['img_ext'].lower() not in ['.tif', '.tiff']:
-        train_transforms.append(
-            A.OneOf([
-                A.HueSaturationValue(),
-                A.RandomBrightnessContrast(),
-            ], p=1)
-        )
-
-    train_transforms.append(A.Resize(config['input_h'], config['input_w']))
-
     # 第三步补充：去掉 A.Normalize()。
     # 原因是 dataset.py 已经统一完成：
     # - RGB: /255
@@ -449,6 +439,7 @@ def main():
     train_dataset = dataset_info['dataset_class'](
         img_ids=dataset_info['train_img_ids'],
         transform=train_transform,
+        augmentation_config=config['train_augmentation_config'],
         **dataset_info['kwargs'])
     val_dataset = dataset_info['dataset_class'](
         img_ids=dataset_info['val_img_ids'],

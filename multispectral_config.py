@@ -86,3 +86,35 @@ normalization_configs = {
 }
 
 normalization_config = normalization_configs[band_mode]
+
+
+# ---------------------------------------------------------------------
+# Training-time online data augmentation
+# ---------------------------------------------------------------------
+# Keep this block aligned with the u2net branch for fair model comparison.
+# These augmentations are applied to training samples only. Validation and test
+# samples remain unchanged.
+train_augmentation_config = {
+    "enabled": True,
+
+    # Multispectral reflectance perturbation.
+    "reflectance_prob": 0.50,
+    "reflectance_global_range": [0.90, 1.10],
+    "reflectance_band_range": [0.95, 1.05],
+
+    # Geometry perturbation: hflip, vflip, rot90, rot180, rot270.
+    "geometry_prob": 0.50,
+
+    # Soft local shadow / thin cloud-shadow perturbation.
+    "shadow_prob": 0.25,
+    "shadow_factor_range": [0.75, 0.90],
+    "shadow_radius_range": [0.25, 0.45],
+
+    # Mild Gaussian noise.
+    "noise_prob": 0.25,
+    "noise_sigma_range": [0.003, 0.008],
+
+    # Random scale by crop and resize back.
+    "scale_prob": 0.20,
+    "scale_crop_range": [0.85, 1.00],
+}

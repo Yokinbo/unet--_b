@@ -1,4 +1,5 @@
 import os
+import random
 
 import cv2
 import numpy as np
@@ -39,7 +40,7 @@ def read_image(image_path, img_ext, bands=None):
     return image
 
 
-def preprocess_image(image, img_ext, config=None):
+def preprocess_image(image, img_ext, config=None, already_reflectance=False):
     # 第二步修改：统一图像预处理。
     # 普通 RGB 图像仍沿用旧逻辑 /255。
     # Sentinel-2 多光谱 tif 通常是 DN = reflectance * 10000，
@@ -51,7 +52,7 @@ def preprocess_image(image, img_ext, config=None):
 
     config = config or normalization_config
     reflectance_scale = float(config.get("reflectance_scale", 10000.0))
-    if reflectance_scale > 0:
+    if reflectance_scale > 0 and not already_reflectance:
         image = image / reflectance_scale
 
     if config.get("enable_clip", False):
@@ -77,6 +78,108 @@ def preprocess_image(image, img_ext, config=None):
     return image
 
 
+def use_training_augmentation(image, img_ext, augmentation_config):
+    return (
+        augmentation_config.get("enabled", False)
+        and is_tif_image(img_ext)
+        and isinstance(image, np.ndarray)
+        and image.ndim == 3
+    )
+
+
+def image_to_reflectance(image, normalization_cfg):
+    reflectance = image.astype(np.float32, copy=False)
+    scale = float(normalization_cfg.get("reflectance_scale", 10000.0))
+    if scale > 0:
+        reflectance = reflectance / scale
+    return reflectance
+
+
+def augment_training_sample(image, mask, normalization_cfg, augmentation_config):
+    reflectance = image_to_reflectance(image, normalization_cfg)
+
+    if random.random() < augmentation_config.get("geometry_prob", 0.0):
+        reflectance, mask = augment_geometry(reflectance, mask)
+
+    if random.random() < augmentation_config.get("scale_prob", 0.0):
+        reflectance, mask = augment_random_scale(reflectance, mask, augmentation_config)
+
+    if random.random() < augmentation_config.get("reflectance_prob", 0.0):
+        reflectance = augment_reflectance(reflectance, augmentation_config)
+
+    if random.random() < augmentation_config.get("shadow_prob", 0.0):
+        reflectance = augment_shadow(reflectance, augmentation_config)
+
+    if random.random() < augmentation_config.get("noise_prob", 0.0):
+        reflectance = augment_noise(reflectance, augmentation_config)
+
+    return reflectance.astype(np.float32), mask
+
+
+def augment_geometry(image, mask):
+    op = random.choice(["hflip", "vflip", "rot90", "rot180", "rot270"])
+    if op == "hflip":
+        return np.ascontiguousarray(image[:, ::-1, :]), np.ascontiguousarray(mask[:, ::-1, ...])
+    if op == "vflip":
+        return np.ascontiguousarray(image[::-1, :, :]), np.ascontiguousarray(mask[::-1, :, ...])
+    k = {"rot90": 1, "rot180": 2, "rot270": 3}[op]
+    return np.rot90(image, k=k).copy(), np.rot90(mask, k=k).copy()
+
+
+def augment_reflectance(image, augmentation_config):
+    global_low, global_high = augmentation_config.get("reflectance_global_range", [0.90, 1.10])
+    band_low, band_high = augmentation_config.get("reflectance_band_range", [0.95, 1.05])
+    global_factor = random.uniform(global_low, global_high)
+    band_factors = np.random.uniform(
+        band_low,
+        band_high,
+        size=(1, 1, image.shape[2]),
+    ).astype(np.float32)
+    return image * global_factor * band_factors
+
+
+def augment_shadow(image, augmentation_config):
+    factor_low, factor_high = augmentation_config.get("shadow_factor_range", [0.75, 0.90])
+    radius_low, radius_high = augmentation_config.get("shadow_radius_range", [0.25, 0.45])
+    h, w = image.shape[:2]
+    center_y = random.uniform(-0.5, 0.5)
+    center_x = random.uniform(-0.5, 0.5)
+    radius = random.uniform(radius_low, radius_high)
+    yy = np.linspace(-1, 1, h, dtype=np.float32)[:, None]
+    xx = np.linspace(-1, 1, w, dtype=np.float32)[None, :]
+    shadow = np.exp(-((xx - center_x) ** 2 + (yy - center_y) ** 2) / max(radius, 1e-6))
+    factor = random.uniform(factor_low, factor_high)
+    shadow_map = 1.0 - (1.0 - factor) * shadow
+    return image * shadow_map[:, :, None]
+
+
+def augment_noise(image, augmentation_config):
+    sigma_low, sigma_high = augmentation_config.get("noise_sigma_range", [0.003, 0.008])
+    sigma = random.uniform(sigma_low, sigma_high)
+    noise = np.random.normal(0.0, sigma, size=image.shape).astype(np.float32)
+    return image + noise
+
+
+def augment_random_scale(image, mask, augmentation_config):
+    crop_low, crop_high = augmentation_config.get("scale_crop_range", [0.85, 1.00])
+    ratio = random.uniform(crop_low, crop_high)
+    h, w = image.shape[:2]
+    crop_h = max(8, int(h * ratio))
+    crop_w = max(8, int(w * ratio))
+    top = random.randint(0, max(0, h - crop_h))
+    left = random.randint(0, max(0, w - crop_w))
+
+    image_crop = image[top:top + crop_h, left:left + crop_w, :]
+    mask_crop = mask[top:top + crop_h, left:left + crop_w, ...]
+    image = cv2.resize(image_crop, (w, h), interpolation=cv2.INTER_LINEAR)
+    mask = cv2.resize(mask_crop, (w, h), interpolation=cv2.INTER_NEAREST)
+    if image.ndim == 2:
+        image = image[:, :, None]
+    if mask.ndim == 2:
+        mask = mask[:, :, None]
+    return image.astype(np.float32), mask
+
+
 class Dataset(torch.utils.data.Dataset):
     def __init__(
             self,
@@ -88,7 +191,8 @@ class Dataset(torch.utils.data.Dataset):
             num_classes,
             transform=None,
             selected_bands=selected_bands,
-            normalization_config=normalization_config):
+            normalization_config=normalization_config,
+            augmentation_config=None):
         """
         Args:
             img_ids (list): Image ids.
@@ -134,6 +238,7 @@ class Dataset(torch.utils.data.Dataset):
         # 与 normalization_config，避免训练/验证读取逻辑不一致。
         self.selected_bands = selected_bands
         self.normalization_config = normalization_config
+        self.augmentation_config = augmentation_config or {"enabled": False}
 
     def __len__(self):
         return len(self.img_ids)
@@ -156,12 +261,22 @@ class Dataset(torch.utils.data.Dataset):
             mask.append(mask_image[..., None])
         mask = np.dstack(mask)
 
+        already_reflectance = False
+        if use_training_augmentation(img, self.img_ext, self.augmentation_config):
+            img, mask = augment_training_sample(
+                img,
+                mask,
+                self.normalization_config,
+                self.augmentation_config,
+            )
+            already_reflectance = True
+
         if self.transform is not None:
             augmented = self.transform(image=img, mask=mask)#这个包比较方便，能把mask也一并做掉
             img = augmented['image']#参考https://github.com/albumentations-team/albumentations
             mask = augmented['mask']
         
-        img = preprocess_image(img, self.img_ext, self.normalization_config)
+        img = preprocess_image(img, self.img_ext, self.normalization_config, already_reflectance)
         img = img.transpose(2, 0, 1)
         mask = mask.astype('float32') / 255
         mask = mask.transpose(2, 0, 1)
@@ -179,7 +294,8 @@ class VOCDataset(torch.utils.data.Dataset):
             mask_ext='.png',
             transform=None,
             selected_bands=selected_bands,
-            normalization_config=normalization_config):
+            normalization_config=normalization_config,
+            augmentation_config=None):
         self.img_ids = img_ids
         self.img_dir = img_dir
         self.mask_dir = mask_dir
@@ -191,6 +307,7 @@ class VOCDataset(torch.utils.data.Dataset):
         # 这里就会自动读取 selected_bands 并执行多光谱预处理。
         self.selected_bands = selected_bands
         self.normalization_config = normalization_config
+        self.augmentation_config = augmentation_config or {"enabled": False}
 
     def __len__(self):
         return len(self.img_ids)
@@ -216,12 +333,22 @@ class VOCDataset(torch.utils.data.Dataset):
         # SegmentationClass stores binary labels as 0/1 in this repo.
         mask = mask[..., None]
 
+        already_reflectance = False
+        if use_training_augmentation(img, self.img_ext, self.augmentation_config):
+            img, mask = augment_training_sample(
+                img,
+                mask,
+                self.normalization_config,
+                self.augmentation_config,
+            )
+            already_reflectance = True
+
         if self.transform is not None:
             augmented = self.transform(image=img, mask=mask)
             img = augmented['image']
             mask = augmented['mask']
 
-        img = preprocess_image(img, self.img_ext, self.normalization_config)
+        img = preprocess_image(img, self.img_ext, self.normalization_config, already_reflectance)
         img = img.transpose(2, 0, 1)
         mask = mask.astype('float32')
         if mask.max() > 1:
