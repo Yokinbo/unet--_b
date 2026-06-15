@@ -42,7 +42,7 @@ LOSS_NAMES.append('BCEWithLogitsLoss')
 
 TRAIN_DEFAULTS = {
     #'name': None,默认模型名字，如果不传命令行参数，默认是arch+timestamp
-    'name': 'voc_run5',
+    'name': 'rgb',
     'epochs': 20,
     'batch_size': 2,
     'arch': 'NestedUNet',

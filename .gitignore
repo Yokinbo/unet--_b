@@ -5,12 +5,13 @@ __pycache__/
 
 # C extensions
 *.so
-
+miou_out/
 models/
 .vscode/
 outputs/
 VOC2007/
 VOCdevkit/
+论文制图/
 # Distribution / packaging
 .Python
 build/

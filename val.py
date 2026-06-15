@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 import archs
 from dataset import Dataset, VOCDataset
-from metrics import binary_confusion_counts, binary_segmentation_metrics, iou_score
+from metrics import iou_score
 from train import TRAIN_DEFAULTS
 from multispectral_config import (
     normalization_config,
@@ -32,7 +32,7 @@ VAL_DEFAULTS = {
     # 在这里选择验证集还是测试集
     # - 'val'  -> 读取 ImageSets/Segmentation/val.txt
     # - 'test' -> 读取 ImageSets/Segmentation/test.txt
-    'split': 'test',
+    'split': 'val',
 }
 
 
@@ -77,6 +77,163 @@ def get_output_name(model_name, split):
     if split == 'val':
         return model_name
     return '%s_%s' % (model_name, split)
+
+
+def fast_hist(label, pred, num_classes):
+    valid = (label >= 0) & (label < num_classes)
+    return np.bincount(
+        num_classes * label[valid].astype(int) + pred[valid].astype(int),
+        minlength=num_classes ** 2,
+    ).reshape(num_classes, num_classes)
+
+
+def per_class_iou(hist):
+    return np.diag(hist) / np.maximum(hist.sum(1) + hist.sum(0) - np.diag(hist), 1)
+
+
+def per_class_recall(hist):
+    return np.diag(hist) / np.maximum(hist.sum(1), 1)
+
+
+def per_class_precision(hist):
+    return np.diag(hist) / np.maximum(hist.sum(0), 1)
+
+
+def pixel_accuracy(hist):
+    return np.sum(np.diag(hist)) / np.maximum(np.sum(hist), 1)
+
+
+def format_percent(value):
+    return '%.3f' % (float(value) * 100)
+
+
+def compute_hist_metrics(hist):
+    ious = per_class_iou(hist)
+    recalls = per_class_recall(hist)
+    precisions = per_class_precision(hist)
+    return {
+        'hist': hist,
+        'ious': ious,
+        'recalls': recalls,
+        'precisions': precisions,
+        'miou': np.nanmean(ious),
+        'mpa': np.nanmean(recalls),
+        'mprecision': np.nanmean(precisions),
+        'accuracy': pixel_accuracy(hist),
+    }
+
+
+def print_miou_metrics(metrics, name_classes):
+    for class_index, class_name in enumerate(name_classes):
+        print(
+            '===>%s:\tIoU-%s; Recall (equal to the PA)-%s; Precision-%s'
+            % (
+                class_name,
+                format_percent(metrics['ious'][class_index]),
+                format_percent(metrics['recalls'][class_index]),
+                format_percent(metrics['precisions'][class_index]),
+            )
+        )
+    print(
+        '===> mIoU: %s; mPA: %s; Accuracy: %s; mPrecision: %s'
+        % (
+            format_percent(metrics['miou']),
+            format_percent(metrics['mpa']),
+            format_percent(metrics['accuracy']),
+            format_percent(metrics['mprecision']),
+        )
+    )
+
+
+def adjust_axes(renderer, text, fig, axes):
+    bbox = text.get_window_extent(renderer=renderer)
+    text_width_inches = bbox.width / fig.dpi
+    current_fig_width = fig.get_figwidth()
+    new_fig_width = current_fig_width + text_width_inches
+    proportion = new_fig_width / current_fig_width
+    x_lim = axes.get_xlim()
+    axes.set_xlim([x_lim[0], x_lim[1] * proportion])
+
+
+def draw_plot_func(values, name_classes, plot_title, x_label, output_path, tick_font_size=12):
+    fig = plt.figure()
+    axes = plt.gca()
+    plt.barh(range(len(values)), values, color='royalblue')
+    plt.title(plot_title, fontsize=tick_font_size + 2)
+    plt.xlabel(x_label, fontsize=tick_font_size)
+    plt.yticks(range(len(values)), name_classes, fontsize=tick_font_size)
+
+    renderer = fig.canvas.get_renderer()
+    for index, value in enumerate(values):
+        text_value = ' ' + str(round(float(value), 3))
+        if value < 1.0:
+            text_value = ' %.3f' % float(value)
+        text = plt.text(
+            value,
+            index,
+            text_value,
+            color='royalblue',
+            va='center',
+            fontweight='bold',
+        )
+        if index == len(values) - 1:
+            adjust_axes(renderer, text, fig, axes)
+
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def show_results(miou_out_path, metrics, name_classes, tick_font_size=12):
+    os.makedirs(miou_out_path, exist_ok=True)
+
+    draw_plot_func(
+        metrics['ious'],
+        name_classes,
+        'mIoU = %.3f%%' % (metrics['miou'] * 100),
+        'Intersection over Union',
+        os.path.join(miou_out_path, 'mIoU.png'),
+        tick_font_size=tick_font_size,
+    )
+    print('Save mIoU out to ' + os.path.join(miou_out_path, 'mIoU.png'))
+
+    draw_plot_func(
+        metrics['recalls'],
+        name_classes,
+        'mPA = %.3f%%' % (metrics['mpa'] * 100),
+        'Pixel Accuracy',
+        os.path.join(miou_out_path, 'mPA.png'),
+        tick_font_size=tick_font_size,
+    )
+    print('Save mPA out to ' + os.path.join(miou_out_path, 'mPA.png'))
+
+    draw_plot_func(
+        metrics['recalls'],
+        name_classes,
+        'mRecall = %.3f%%' % (metrics['mpa'] * 100),
+        'Recall',
+        os.path.join(miou_out_path, 'Recall.png'),
+        tick_font_size=tick_font_size,
+    )
+    print('Save Recall out to ' + os.path.join(miou_out_path, 'Recall.png'))
+
+    draw_plot_func(
+        metrics['precisions'],
+        name_classes,
+        'mPrecision = %.3f%%' % (metrics['mprecision'] * 100),
+        'Precision',
+        os.path.join(miou_out_path, 'Precision.png'),
+        tick_font_size=tick_font_size,
+    )
+    print('Save Precision out to ' + os.path.join(miou_out_path, 'Precision.png'))
+
+    confusion_matrix_path = os.path.join(miou_out_path, 'confusion_matrix.csv')
+    with open(confusion_matrix_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([' '] + [str(c) for c in name_classes])
+        for class_index, class_name in enumerate(name_classes):
+            writer.writerow([class_name] + [str(int(x)) for x in metrics['hist'][class_index]])
+    print('Save confusion_matrix out to ' + confusion_matrix_path)
 
 
 def get_dataset_info(config, split='val'):
@@ -161,12 +318,14 @@ def main():
     with open('models/%s/config.yml' % args.name, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     config = complete_multispectral_config(config)
+    run_name = args.name
     config['eval_split'] = args.split
-    output_name = get_output_name(config['name'], args.split)
+    output_name = get_output_name(run_name, args.split)
 
     print('-'*20)
     for key in config.keys():
         print('%s: %s' % (key, str(config[key])))
+    print('%s: %s' % ('run_name', run_name))
     print('%s: %s' % ('output_name', output_name))
     print('-'*20)
 
@@ -183,8 +342,9 @@ def main():
     # Data loading code
     dataset_info = get_dataset_info(config, args.split)
 
-    model.load_state_dict(torch.load('models/%s/model.pth' %
-                                     config['name']))
+    checkpoint_path = os.path.join('models', run_name, 'model.pth')
+    print('=> loading checkpoint %s' % checkpoint_path)
+    model.load_state_dict(torch.load(checkpoint_path))
     model.eval()
 
     # 第四步修改：去掉验证阶段的 A.Normalize()。
@@ -206,10 +366,11 @@ def main():
         drop_last=False)
 
     avg_meter = AverageMeter()
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-    total_tn = 0
+    metric_num_classes = 2 if config['num_classes'] == 1 else config['num_classes']
+    name_classes = ['_background_', 'PV'] if metric_num_classes == 2 else [
+        'class_%d' % i for i in range(metric_num_classes)
+    ]
+    hist = np.zeros((metric_num_classes, metric_num_classes), dtype=np.float64)
 
     for c in range(config['num_classes']):
         os.makedirs(os.path.join('outputs', output_name, str(c)), exist_ok=True)
@@ -226,11 +387,15 @@ def main():
 
             iou = iou_score(output, target)
             avg_meter.update(iou, input.size(0))
-            tp, fp, fn, tn = binary_confusion_counts(output, target)
-            total_tp += tp
-            total_fp += fp
-            total_fn += fn
-            total_tn += tn
+            if config['num_classes'] == 1:
+                pred = (torch.sigmoid(output) > 0.5).long().squeeze(1).cpu().numpy()
+                label = (target > 0.5).long().squeeze(1).cpu().numpy()
+            else:
+                pred = torch.argmax(output, dim=1).cpu().numpy()
+                label = torch.argmax(target, dim=1).cpu().numpy()
+
+            for label_i, pred_i in zip(label, pred):
+                hist += fast_hist(label_i.flatten(), pred_i.flatten(), metric_num_classes)
 
             output = torch.sigmoid(output).cpu().numpy()
 
@@ -239,16 +404,13 @@ def main():
                     cv2.imwrite(os.path.join('outputs', output_name, str(c), meta['img_id'][i] + '.jpg'),
                                 (output[i, c] * 255).astype('uint8'))
 
-    metrics = binary_segmentation_metrics(total_tp, total_fp, total_fn, total_tn)
+    metrics = compute_hist_metrics(hist)
 
-    print('BatchMeanIoU: %.4f' % avg_meter.avg)
-    print('Precision: %.4f' % metrics['precision'])
-    print('Recall: %.4f' % metrics['recall'])
-    print('F1: %.4f' % metrics['f1'])
-    print('IoU: %.4f' % metrics['iou'])
-    print('mIoU: %.4f' % metrics['miou'])
+    print('BatchMeanIoU: %.3f' % (avg_meter.avg * 100))
+    print_miou_metrics(metrics, name_classes)
 
-    save_metrics(output_name, avg_meter.avg, metrics, total_tp, total_fp, total_fn, total_tn, args.split)
+    save_metrics(output_name, avg_meter.avg, metrics, name_classes, args.split)
+    show_results(os.path.join('miou_out', output_name), metrics, name_classes)
 
     plot_examples(input, target, model, config, output_name, num_examples=3)
     
@@ -300,26 +462,33 @@ def plot_examples(datax, datay, model, config, output_name, num_examples=6):
     plt.close(fig)
 
 
-def save_metrics(run_name, batch_mean_iou, metrics, tp, fp, fn, tn, split):
+def rounded_percent(value):
+    return round(float(value) * 100, 3)
+
+
+def save_metrics(run_name, batch_mean_iou, metrics, name_classes, split):
     save_dir = os.path.join('outputs', run_name)
     os.makedirs(save_dir, exist_ok=True)
 
     yaml_path = os.path.join(save_dir, 'metrics.yml')
     csv_path = os.path.join(save_dir, 'metrics.csv')
+    confusion_matrix_path = os.path.join(save_dir, 'confusion_matrix.csv')
 
     payload = {
         'split': split,
-        'precision': float(metrics['precision']),
-        'recall': float(metrics['recall']),
-        'f1': float(metrics['f1']),
-        'iou': float(metrics['iou']),
-        'miou': float(metrics['miou']),
-        'batch_mean_iou': float(batch_mean_iou),
-        'tp': int(tp),
-        'fp': int(fp),
-        'fn': int(fn),
-        'tn': int(tn),
+        'batch_mean_iou_percent': rounded_percent(batch_mean_iou),
+        'miou_percent': rounded_percent(metrics['miou']),
+        'mpa_percent': rounded_percent(metrics['mpa']),
+        'accuracy_percent': rounded_percent(metrics['accuracy']),
+        'mprecision_percent': rounded_percent(metrics['mprecision']),
+        'classes': {},
     }
+    for class_index, class_name in enumerate(name_classes):
+        payload['classes'][class_name] = {
+            'iou_percent': rounded_percent(metrics['ious'][class_index]),
+            'recall_pa_percent': rounded_percent(metrics['recalls'][class_index]),
+            'precision_percent': rounded_percent(metrics['precisions'][class_index]),
+        }
 
     with open(yaml_path, 'w') as f:
         yaml.dump(payload, f)
@@ -327,8 +496,24 @@ def save_metrics(run_name, batch_mean_iou, metrics, tp, fp, fn, tn, split):
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['metric', 'value'])
-        for key in ['split', 'precision', 'recall', 'f1', 'iou', 'miou', 'batch_mean_iou', 'tp', 'fp', 'fn', 'tn']:
+        for key in ['split', 'batch_mean_iou_percent', 'miou_percent', 'mpa_percent', 'accuracy_percent', 'mprecision_percent']:
             writer.writerow([key, payload[key]])
+        writer.writerow([])
+        writer.writerow(['class', 'iou_percent', 'recall_pa_percent', 'precision_percent'])
+        for class_name in name_classes:
+            class_metrics = payload['classes'][class_name]
+            writer.writerow([
+                class_name,
+                class_metrics['iou_percent'],
+                class_metrics['recall_pa_percent'],
+                class_metrics['precision_percent'],
+            ])
+
+    with open(confusion_matrix_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([' '] + [str(c) for c in name_classes])
+        for class_index, class_name in enumerate(name_classes):
+            writer.writerow([class_name] + [str(int(x)) for x in metrics['hist'][class_index]])
 
 
 if __name__ == '__main__':
